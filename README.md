@@ -1,6 +1,12 @@
-# 抢占显卡脚本
+# 实验室抢占显卡脚本
 
 ## Python 版本
+需要安装库 cupy-cudaXXX (根据电脑上的CUDA版本决定 cupy-cuda12x 或者 cupy-cuda13x)
+使用命令
+
+```shell
+pip install cupy-cuda12x
+```
 
 `gg.py` 会先尝试在指定 GPU 上占用显存。抢占成功后：
 
