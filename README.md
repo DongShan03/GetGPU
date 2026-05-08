@@ -1,5 +1,7 @@
 # 实验室抢占显卡脚本
 
+原版本链接https://github.com/godweiyang/GrabGPU.git
+
 ## Python 版本
 需要安装库 cupy-cudaXXX (根据电脑上的CUDA版本决定 cupy-cuda12x 或者 cupy-cuda13x)
 使用命令
