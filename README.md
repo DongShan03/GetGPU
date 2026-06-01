@@ -1,104 +1,130 @@
-# 实验室抢占显卡脚本
+# gg.py 使用说明
 
-主文件：`gg.py`
+`gg.py` 用于抢占 GPU 并在抢到后运行计算负载。当前版本只依赖 PyTorch，不再依赖 CuPy。
 
-这个脚本用于在本机或 Ray 集群中等待并占用指定 GPU 显存。抢占成功后，可以继续运行默认的 PyTorch GEMM 负载来维持 GPU 利用率，也可以释放已占用显存后执行自定义训练命令。
+## 工作流程
 
-原版本链接：https://github.com/godweiyang/GrabGPU.git
+1. 根据 `--gpus` 选择本机可见 GPU，`-1` 表示全部可见 GPU。
+2. 按 `--mem-ratio` 或 `--mem-gb` 在每张卡上分配 PyTorch tensor，占住显存。
+3. 如果有卡暂时分配失败，按 `--retry-interval` 重试。
+4. 抢到所有目标卡后：
+   - 默认启动 `torch.distributed.run`，每张卡一个 worker。
+   - 每个 worker 在自己的 GPU 上独立测量候选 GEMM shape，选择不会 OOM 且接近目标迭代耗时的 FP16 GEMM + backward 负载。
+   - 如果传了 `--cmd`，会先释放抢卡 tensor，再把 `CUDA_VISIBLE_DEVICES` 设置为抢到的卡并执行命令。
+
+脚本不会主动写额外日志文件。进度日志只由 rank 0 输出，默认每 300 秒一次，可用 `--log-interval` 调整，设置为 `0` 可关闭进度日志。
+
+Ray 提交默认使用 `--no-wait`，提交后不持续流式打印远端 job 日志。如果需要阻塞等待 job 结束并查看 Ray 日志，加 `--ray-wait`。
 
 ## 依赖
 
-需要安装支持 CUDA 的 PyTorch：
+- Python 3
+- PyTorch CUDA 版本
+- 多节点提交需要 Ray CLI
 
-```shell
-pip install torch
+不需要安装 CuPy。
+
+## 本机占用
+
+占用本机全部可见 GPU，默认占每张卡 75% 显存，持续 24 小时：
+
+```bash
+python3 gg.py --gpus -1
 ```
-
-如需使用 Ray 提交多节点任务，还需要安装并配置 Ray：
-
-```shell
-pip install ray
-```
-
-## 基本使用
 
 占用指定 GPU：
 
-```shell
-python gg.py --gpus 4,5
+```bash
+python3 gg.py --gpus 0,1,2,3 --mem-ratio 0.7 --time-hours 24
 ```
+
+固定每张卡占用 60GB 显存：
+
+```bash
+python3 gg.py --gpus -1 --mem-gb 60
+```
+
+降低控制台输出：
+
+```bash
+python3 gg.py --gpus -1 --log-interval 0
+```
+
+## 多节点 Ray 提交
+
+提交 4 个 Ray job，每个 job 申请 8 张 GPU：
+
+```bash
+python3 gg.py \
+  --nodes 4 \
+  --gpus-per-node 8 \
+  --mem-ratio 0.75 \
+  --time-hours 24 \
+  --ray-env NCCL_DEBUG=INFO \
+  --ray-env NCCL_SOCKET_IFNAME=eth0 \
+  --ray-env GLOO_SOCKET_IFNAME=eth0
+```
+
+如果需要在提交端等待任务结束：
+
+```bash
+python3 gg.py --nodes 4 --gpus-per-node 8 --ray-wait
+```
+
+如果 Ray runtime 环境没有 PyTorch，可以加：
+
+```bash
+--ray-pip torch,numpy
+```
+
+## 抢卡策略
+
+`--allocation-mode incremental` 是默认策略。已经抢到的卡会一直保留，脚本只继续等待剩余卡。
+
+`--allocation-mode all-or-nothing` 表示任意一张卡失败时释放本轮已经抢到的卡，下轮重新尝试，更适合需要一组卡同时空闲的场景。
+
+## GEMM shape 自动测量
+
+默认 `--gemm-shape auto`。每个 GPU worker 会在启动后读取当前卡剩余显存，再按候选 shape 做短 benchmark。这个测量发生在抢卡 tensor 已经占住显存之后，所以它看到的是实际可用于计算负载的剩余显存。
+
+选择规则：
+
+1. 先按 `--gemm-auto-memory-ratio` 过滤明显超过剩余显存预算的候选 shape。
+2. 对候选 shape 从小到大做 FP16 GEMM + backward benchmark，OOM 的候选会跳过。
+3. 优先选择单步耗时不超过 `--gemm-auto-target-ms` 且最接近目标耗时的 shape。
+4. 如果所有可运行候选都超过目标耗时，则选择最快的可运行 shape。
+5. 一旦候选达到或超过目标耗时，会停止继续探测更大的候选，避免启动阶段过长。
 
 默认参数：
 
 ```text
---gpus -1              # 默认占用所有可见 GPU
---mem-ratio 0.75       # 每张指定 GPU 占用其总显存的 75%
---time-hours 24        # 默认占用 24 小时
---utilization 0.8      # 默认目标利用率 80%
---utilization-jitter 0.1
---allocation-mode incremental
---retry-interval 60
+--gemm-shape auto
+--gemm-auto-target-ms 500
+--gemm-auto-memory-ratio 0.75
+--gemm-auto-benchmark-iters 2
 ```
 
-## 常用示例
+这个模式适合不同节点或同一节点混用不同型号 GPU 的情况，因为每张卡都会独立决定 shape，不要求所有 rank 一致。
 
-指定固定显存占用：
+## 固定 GEMM shape
 
-```shell
-python gg.py --gpus 4,5 --mem-gb 30
+如果确认都是 H20 或希望复现实验，可以使用固定 shape：
+
+```bash
+python3 gg.py --gpus -1 \
+  --gemm-shape fixed \
+  --gemm-m 8192 \
+  --gemm-k 12288 \
+  --gemm-n 16384
 ```
 
-抢到 GPU 后运行训练命令：
+如果固定 shape 导致 GEMM worker OOM，可以降低 `--mem-ratio` 或调小 `--gemm-m/k/n`。混卡场景建议使用默认自动模式。
 
-```shell
-python gg.py --gpus 4,5 --cmd "bash scripts/train.sh stage3_only"
+## 抢到卡后执行自定义命令
+
+```bash
+python3 gg.py --gpus 0,1,2,3 --mem-ratio 0.7 \
+  --cmd "python3 -m torch.distributed.run --nproc_per_node=4 your_script.py"
 ```
 
-执行 `--cmd` 前，脚本会释放抢占用的显存，并设置：
-
-```shell
-CUDA_VISIBLE_DEVICES=<--gpus 指定的 GPU 列表>
-```
-
-自定义占用时间和利用率：
-
-```shell
-python gg.py --gpus 4,5 --time-hours 12 --utilization 0.9
-```
-
-使用固定 GEMM 形状：
-
-```shell
-python gg.py --gpus 4,5 --gemm-shape fixed --gemm-m 8192 --gemm-k 12288 --gemm-n 16384
-```
-
-通过 Ray 提交多个任务：
-
-```shell
-python gg.py --ray-submit --nodes 2 --gpus-per-node 8 --working-dir .
-```
-
-## 参数
-
-```text
---gpus                  GPU ID，支持逗号或空格分隔；-1 表示全部可见 GPU。
---mem-gb                每张指定 GPU 固定占用的显存 GB，不传时使用 --mem-ratio。
---mem-ratio             每张指定 GPU 占其总显存的比例，默认 0.75。
---allocation-mode       incremental 或 all-or-nothing，默认 incremental。
---retry-interval        抢占失败后的重试间隔秒数，默认 60。
---time-hours            默认 GEMM 负载运行时长，默认 24。
---utilization           目标 GPU 利用率，默认 0.8。
---utilization-jitter    利用率随机波动范围，默认 0.1。
---log-interval          rank 0 进度日志间隔秒数，默认 300；0 表示关闭。
---cmd                   抢到 GPU 后执行的一整条命令字符串。
---gemm-shape            auto 或 fixed，默认 auto。
---master-port           本机 torch.distributed.run 使用的端口，默认 12345。
---nodes                 Ray 提交任务数量，大于 1 时进入 Ray 提交模式。
---ray-submit            显式使用 Ray job submit。
---ray-wait              等待 Ray jobs 并输出日志。
---gpus-per-node         每个 Ray job 申请的 GPU 数量。
---ray-address           Ray jobs server 地址，默认读取 RAY_ADDRESS。
---working-dir           Ray 上传的工作目录，默认当前目录。
---ray-env               Ray runtime_env 环境变量，格式 KEY=VALUE，可重复。
---ray-pip               Ray runtime_env pip 依赖，可重复或逗号分隔。
-```
+使用 `--cmd` 时，脚本只负责等待并确认卡可用；命令启动前会释放抢卡 tensor，把显存交给自定义任务使用。
