@@ -13,6 +13,7 @@ BYTES_PER_GB = 1024.0 * 1024.0 * 1024.0
 DEFAULT_GEMM_M = 8192
 DEFAULT_GEMM_K = 12288
 DEFAULT_GEMM_N = 16384
+DEFAULT_GEMM_INNER_ITERS = 4
 GEMM_CANDIDATES = (
     (1024, 2048, 2048),
     (2048, 4096, 4096),
@@ -24,6 +25,9 @@ GEMM_CANDIDATES = (
     (12288, 12288, 16384),
     (12288, 16384, 16384),
     (16384, 16384, 16384),
+    (16384, 16384, 24576),
+    (16384, 24576, 24576),
+    (24576, 24576, 24576),
 )
 
 torch = None
@@ -67,8 +71,8 @@ def parse_args():
     parser.add_argument(
         "--mem-ratio",
         type=float,
-        default=0.75,
-        help="GPU memory ratio to occupy when --mem-gb is not set. Default: 0.75.",
+        default=0.9,
+        help="GPU memory ratio to occupy when --mem-gb is not set. Default: 0.9.",
     )
     parser.add_argument(
         "--allocation-mode",
@@ -95,14 +99,14 @@ def parse_args():
     parser.add_argument(
         "--utilization",
         type=float,
-        default=0.8,
-        help="Target GPU utilization in (0.0, 1.0]. Default: 0.8.",
+        default=1.0,
+        help="Target GPU utilization in (0.0, 1.0]. Default: 1.0.",
     )
     parser.add_argument(
         "--utilization-jitter",
         type=float,
-        default=0.1,
-        help="Random utilization jitter around --utilization. Default: 0.1.",
+        default=0.0,
+        help="Random utilization jitter around --utilization. Default: 0.0.",
     )
     parser.add_argument(
         "--log-interval",
@@ -148,14 +152,23 @@ def parse_args():
     parser.add_argument(
         "--gemm-sleep",
         type=float,
-        default=0.1,
-        help="Extra sleep seconds after each GEMM iteration. Default: 0.1.",
+        default=0.0,
+        help="Extra sleep seconds after each GEMM iteration. Default: 0.0.",
+    )
+    parser.add_argument(
+        "--gemm-inner-iters",
+        type=int,
+        default=DEFAULT_GEMM_INNER_ITERS,
+        help=(
+            "Number of GEMM forward passes accumulated before one backward/sync. "
+            f"Higher values reduce CPU scheduling overhead. Default: {DEFAULT_GEMM_INNER_ITERS}."
+        ),
     )
     parser.add_argument(
         "--gemm-auto-target-ms",
         type=float,
-        default=500.0,
-        help="Target single-iteration time used by auto shape selection. Default: 500.",
+        default=1000.0,
+        help="Target single-iteration time used by auto shape selection. Default: 1000.",
     )
     parser.add_argument(
         "--gemm-auto-memory-ratio",
@@ -266,6 +279,8 @@ def validate_common_args(args):
         raise ValueError("GEMM warmup iterations must be non-negative")
     if args.gemm_sleep < 0.0:
         raise ValueError("GEMM sleep must be non-negative")
+    if args.gemm_inner_iters <= 0:
+        raise ValueError("GEMM inner iterations must be positive")
     if args.gemm_auto_target_ms <= 0.0:
         raise ValueError("Auto GEMM target ms must be positive")
     if args.gemm_auto_memory_ratio <= 0.0 or args.gemm_auto_memory_ratio > 1.0:
@@ -436,9 +451,9 @@ class GemmMonster:
         return self
 
 
-def estimate_gemm_memory(m, k, n):
+def estimate_gemm_memory(m, k, n, inner_iters=1):
     # Rough fp16 forward/backward footprint: params, grads, input/output, saved activations.
-    return 8 * k * n + 4 * m * k + 4 * m * n
+    return 8 * k * n + inner_iters * (4 * m * k + 4 * m * n)
 
 
 def cleanup_cuda(torch_module, device):
@@ -454,24 +469,27 @@ def create_gemm_workload(torch_module, nn, device, shape):
     return model, x
 
 
-def run_gemm_step(torch_module, model, x):
+def run_gemm_step(torch_module, model, x, inner_iters=1):
     model.zero_grad()
-    out = model(torch_module, x)
-    loss = out.sum()
+    loss = None
+    for _ in range(inner_iters):
+        out = model(torch_module, x)
+        current_loss = out.sum()
+        loss = current_loss if loss is None else loss + current_loss
     loss.backward()
     torch_module.cuda.synchronize()
 
 
-def benchmark_gemm_shape(torch_module, nn, device, shape, benchmark_iters):
+def benchmark_gemm_shape(torch_module, nn, device, shape, benchmark_iters, inner_iters):
     model = None
     x = None
     try:
         model, x = create_gemm_workload(torch_module, nn, device, shape)
-        run_gemm_step(torch_module, model, x)
+        run_gemm_step(torch_module, model, x, inner_iters)
 
         start = time.perf_counter()
         for _ in range(benchmark_iters):
-            run_gemm_step(torch_module, model, x)
+            run_gemm_step(torch_module, model, x, inner_iters)
         elapsed = time.perf_counter() - start
         return elapsed * 1000.0 / benchmark_iters
     except Exception as error:
@@ -490,7 +508,7 @@ def choose_auto_gemm_shape(torch_module, nn, device, args):
     memory_budget = int(free_size * args.gemm_auto_memory_ratio)
     candidates = [
         shape for shape in GEMM_CANDIDATES
-        if estimate_gemm_memory(*shape) <= memory_budget
+        if estimate_gemm_memory(*shape, args.gemm_inner_iters) <= memory_budget
     ]
     if not candidates:
         candidates = [GEMM_CANDIDATES[0]]
@@ -503,6 +521,7 @@ def choose_auto_gemm_shape(torch_module, nn, device, args):
             device,
             shape,
             args.gemm_auto_benchmark_iters,
+            args.gemm_inner_iters,
         )
         if avg_ms is not None:
             results.append((shape, avg_ms))
@@ -544,12 +563,12 @@ def run_torch_gemm_worker(args):
     model, x = create_gemm_workload(torch_module, nn, device, shape)
 
     for _ in range(args.gemm_warmup):
-        run_gemm_step(torch_module, model, x)
+        run_gemm_step(torch_module, model, x, args.gemm_inner_iters)
 
     measured_text = "fixed" if measured_ms is None else f"{measured_ms:.1f}ms"
     print(
         f"GEMM rank {rank}/{world_size} local_rank={local_rank} "
-        f"shape=({shape[0]},{shape[1]},{shape[2]}) measured={measured_text}"
+        f"shape=({shape[0]},{shape[1]},{shape[2]}) inner_iters={args.gemm_inner_iters} measured={measured_text}"
     )
 
     start_total = time.monotonic()
@@ -567,7 +586,7 @@ def run_torch_gemm_worker(args):
             next_jitter_time = now + random.uniform(3.0, 8.0)
 
         t1 = time.perf_counter()
-        run_gemm_step(torch_module, model, x)
+        run_gemm_step(torch_module, model, x, args.gemm_inner_iters)
         t2 = time.perf_counter()
 
         iterations += 1
@@ -587,7 +606,7 @@ def run_torch_gemm_worker(args):
         if rank == 0 and should_log:
             print(
                 f"GEMM progress: {elapsed_hours:.2f}h, target_util={current_utilization * 100:.1f}%, "
-                f"last_iter={on_time * 1000.0:.1f}ms, iters={iterations}"
+                f"last_iter={on_time * 1000.0:.1f}ms, inner_iters={args.gemm_inner_iters}, iters={iterations}"
             )
             last_log_time = now
 
@@ -644,6 +663,8 @@ def run_torch_gemm_script(gpu_ids, args):
         str(args.gemm_warmup),
         "--gemm-sleep",
         str(args.gemm_sleep),
+        "--gemm-inner-iters",
+        str(args.gemm_inner_iters),
         "--gemm-auto-target-ms",
         str(args.gemm_auto_target_ms),
         "--gemm-auto-memory-ratio",
@@ -733,6 +754,8 @@ def build_child_occupy_command(args, node_idx):
         str(args.gemm_warmup),
         "--gemm-sleep",
         str(args.gemm_sleep),
+        "--gemm-inner-iters",
+        str(args.gemm_inner_iters),
         "--gemm-auto-target-ms",
         str(args.gemm_auto_target_ms),
         "--gemm-auto-memory-ratio",
